@@ -96,7 +96,19 @@ for free.
 **9. ~~Seasons / climate.~~ DONE (step 3).** See `climate.lua`. Fitted to
 Providence normals; validated against monthly means, daily standard
 deviation, wet-day count and annual rainfall.
-**10. Procedural plant growth — FIRST PLANT IN (step 6).** `mullein.lua`.
+**10. Procedural plant growth — FIRST PLANT IN (step 6, revised step 8).**
+
+Leaf size and angle derive from each leaf's OWN age, not its rank in the list.
+Ranking was a real bug: the instant a second leaf appeared, the first jumped to
+a new size and angle. Now a leaf emerges at effectively zero size, swells
+asymptotically toward its own terminal size, and is pushed progressively
+flatter as it ages. Terminal size, width ratio and lean are per-leaf
+deterministic randoms, so no two leaves match but every leaf is the same every
+time it draws.
+
+Phyllotaxis is spiral at the golden angle, which is correct for mullein
+(alternate, not opposite pairs) and reads as irregular rather than mechanical.
+ `mullein.lua`.
 Growth is instruction-driven: leaf count, rosette spread and spike height are
 numbers accumulated from real climate, and the shape is derived from them.
 Validated life cycle: germinates mid-April, 42cm rosette by August, overwinters
@@ -272,6 +284,130 @@ early can look at the growing-degree total and find out.
 
 Do not touch this until the game exists. Noted only so the panels are not
 thrown away.
+
+## Systems worth building
+
+**22. Snow and water accumulation.** Not decoration -- both feed growth
+directly, and one of them fixes an architectural mistake.
+
+*Snowpack.* Accumulate depth from `snowMM`, melt with degree-days above 0.
+Two real consequences worth having: snow cover INSULATES a rosette (the
+subnivean layer sits near freezing while the air above is far colder, which is
+how a first-year mullein survives a bad January), and a deep pack DELAYS spring
+soil warming, so a heavy winter pushes bolting later. Also the obvious visual:
+the ground goes pale.
+
+*Soil moisture.* Currently each plant carries its own `waterRun` balance, and
+that is wrong in two ways. It is a property of the FIELD, not the plant -- 200
+plants standing in one field do not each have their own weather. And computing
+it per plant is 200x the work for a number they should all be reading.
+
+Move it to a soil module: a daily balance with field capacity, runoff above it,
+and evapotranspiration drawn off the top. **This is where wind genuinely
+belongs** -- ET rises with temperature AND wind speed, which is a real coupling
+and a much better use of the wind model than blowing rain sideways. Note it
+would have been wrong to couple wind to temperature; coupling it to ET is
+correct.
+
+**25. Decomposition and soil nutrients.** The loop that makes succession
+actually work, and the piece that gives collecting a cost.
+
+Dead plants become litter. Litter decays at a rate set by temperature and
+moisture -- decomposition roughly doubles per 10 C, and stalls when dry or
+frozen, so a warm wet autumn breaks down a season's growth and a cold dry one
+leaves it standing until spring. Decayed litter becomes soil nutrient.
+
+Three consequences, each doing real work:
+
+*It drives succession forward on its own.* Mullein wants poor, disturbed,
+low-nutrient ground. Grasses and shrubs want richer ground. So every plant that
+lives and dies enriches the soil slightly and shifts the field away from the
+pioneers -- which is exactly what happens in a real abandoned field, and it
+means succession has an engine rather than a timer.
+
+*It gives the collecting verb a cost.* Take the specimen and you export the
+biomass; leave the plant to rot and its nutrients return. Pressing a flower is
+already destructive to that individual; this makes it destructive to the field's
+budget too. A player filling a catalogue is quietly impoverishing the ground.
+That is a real tension and it costs almost nothing to implement.
+
+*It stocks the decomposer catalogue.* Fungi fruiting on litter -- seasonal,
+ephemeral, and gone if you crank past them, which suits the no-rewind rule
+perfectly. Snails and slugs on damp decaying matter. Beetles, springtails.
+These want the SAME treatment as plants: driven by the same weather, appearing
+where the conditions are, not spawned on a timer.
+
+**25b. Herbivory.** Note the specific case, because it is a dependency chain
+rather than a damage system: mullein is largely left alone -- the felted hairs
+deter most grazers -- but the mullein moth (*Cucullia verbasci*) is a
+specialist whose caterpillars eat almost nothing else. So that moth cannot
+appear in the field until mullein is established, and it arrives BECAUSE the
+mullein did.
+
+That is the shape worth building toward: creatures that are consequences of the
+plant community, not decorations sprinkled over it. It also gives the catalogue
+a natural difficulty curve without any difficulty being designed.
+
+**23. Eclipses.** Currently impossible BY CONSTRUCTION: `Climate.moonAltitude`
+ignores the moon's 5.1 degree orbital inclination, which is exactly the real
+reason eclipses do not happen every month. Restore the inclination and model
+the lunar nodes -- the two points where the moon crosses the ecliptic -- and
+eclipses fall out on their own. The nodes regress on an 18.6-year cycle, which
+is a lovely slow rhythm for a game measured in years.
+
+Lunar eclipses are the ones to build: visible for hours, dramatic, and the moon
+is already fully modelled. A given location sees a total lunar eclipse every few
+years.
+
+Solar totality at a fixed spot averages roughly once every 375 years, which
+makes it hurricane-class rarity -- an event essentially nobody will see, and all
+the better for it if one player ever does.
+
+**24. Encyclopedia.** A naturalist's commonplace book, filling as things are
+OBSERVED rather than unlocked by progress. Seeing the thing is what earns the
+entry, which is the same logic as the specimen catalogue and reinforces
+watching as the primary verb.
+
+The seed entry, and the reason for the whole idea: *a full moon rides opposite
+the sun, so its declination is roughly the negative of the sun's -- which means
+a full moon in December takes the summer sun's high path, and a full moon in
+June skulks along the horizon.* That is already true in the simulation, and a
+player could notice it before being told. Entries should mostly be like that:
+things the model already does, waiting to be spotted.
+
+Other candidates already live in the code: the moon rising ~50 minutes later
+each day; the coldest day of the year falling in late January rather than at the
+solstice; easterlies being the rare wind here; mullein needing a real winter
+before it can flower; a sidereal day being four minutes short of a solar one.
+
+## Performance
+
+**21. The 200-plant budget.** Measured, not guessed. Desktop Lua is roughly
+20-30x faster than the Playdate interpreter, so scale accordingly.
+
+| operation | desktop | ~hardware | x200 plants |
+|---|---|---|---|
+| `Mullein.grow()` from birth, 400-day plant | 0.93 ms | ~28 ms | 5.6 s |
+| `Mullein.step()` one day | 0.25 us | ~7 us | 1.4 ms |
+| `Mullein.geometry()` | 0.033 ms | ~1 ms | 200 ms |
+
+Two rules follow, and they are not optional at scale:
+
+**Step, do not regrow.** `Mullein.new()` + `Mullein.step()` advance a plant one
+day; `grow()` re-walks its whole life. Measured 3543x difference for 200 plants
+advancing one day. Verified that stepping produces bit-identical state to
+growing, so determinism is untouched -- we simply stop rederiving what we
+already know. Rebuild from birth only on a rewind or a long jump.
+
+**Regenerate geometry once per day, not once per frame.** Growth only changes
+daily. At 30 fps that is a 30x saving for free, and it is already wired for the
+bench plant.
+
+STILL TO DO for a real field: render each plant into a `gfx.image` when its
+geometry changes and blit thereafter. Blitting is nearly free; polygon filling
+is not. That is what turns 200 ms into something affordable. Plants far from the
+camera can also drop to a coarser polygon count, since `leafPolygon` already
+takes its resolution from a single `n`.
 
 ## Known limits
 

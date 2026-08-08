@@ -27,8 +27,11 @@ Mullein = {}
 -- All lengths in centimetres. Providence delivers roughly 2800 GDD (base 5)
 -- in a year, which is the number to hold in mind when reading thresholds.
 
-local GDD_PER_LEAF   <const> = 205    -- one new leaf per this much warmth
-local MAX_LEAVES     <const> = 6      -- more than this and the fan is mush
+local GDD_PER_LEAF   <const> = 175    -- a new leaf emerges per this much warmth
+local MAX_LEAVES     <const> = 7      -- more than this and the fan is mush
+local LEAF_TAU       <const> = 260    -- warmth for a leaf to approach full size
+local ANGLE_TAU      <const> = 620    -- warmth for a leaf to be pushed flat
+local FAN_SPREAD     <const> = 86     -- degrees either side of vertical
 local ROSETTE_MAX_R  <const> = 21     -- cm, radius; ~40cm across a good rosette
 local ROSETTE_GDD    <const> = 1500   -- warmth to reach full rosette spread
 
@@ -37,7 +40,9 @@ local CHILL_REQUIRED <const> = 45     -- vernalization threshold, days
 local BOLT_MIN_LEAVES<const> = 4      -- too small a rosette cannot bolt
 local BOLT_GDD       <const> = 190    -- spring warmth needed to start bolting
 
-local SPIKE_MAX      <const> = 195    -- cm
+local SPIKE_MAX      <const> = 195    -- cm, whole second-year stem
+local INFLOR_FRAC    <const> = 0.20   -- top fifth is the dense flower spike
+local CAULINE_GAP    <const> = 11     -- cm between stem leaves
 local GDD_PER_CM     <const> = 7.5    -- spike elongation rate
 local FLOWER_START   <const> = 55     -- spike height at which flowering opens
 local FLOWER_GDD     <const> = 900    -- warmth from first flower to seed set
@@ -52,117 +57,128 @@ local DROUGHT_LIMIT  <const> = 34     -- accumulated stress-days that kill it
 -- returns state. Same pattern as accumulateGDD in main.lua -- the caller
 -- should cache per day rather than calling this every frame.
 
-function Mullein.grow(germDay, today)
-    local st = {
+-- A fresh plant. All the accumulators live in the state table rather than as
+-- locals, which is what lets a plant be advanced one day at a time instead of
+-- being recomputed from birth.
+function Mullein.new(germDay, seed)
+    seed = seed or 1
+    return {
+        germDay = germDay, day = germDay - 1,
+        seed = seed, tr = Mullein.traits(seed),
         stage = "seed", age = 0,
         gdd = 0, chill = 0, stress = 0,
         leaves = 0, rosetteR = 0, spike = 0,
-        flowerLow = 0, flowerHigh = 0,   -- the band of open flowers, cm
+        flowerLow = 0, flowerHigh = 0, inflorBase = 0,
         vernalized = false, alive = true, seedsSet = false,
+        -- internals
+        bolted = false, boltGDD = 0, flowerGDD = 0, seedGDD = 0,
+        springGDD = 0, dieback = 0,
+        -- Start at the running equilibrium, not zero. Starting dry means every
+        -- seedling spends its first fortnight in a drought that never happened.
+        waterRun = 30,
     }
-    if today < germDay then return st end
+end
 
-    local bolted, boltGDD, flowerGDD, seedGDD = false, 0, 0, 0
-    local dieback = 0
-    local springGDD = 0
-    -- Start at the running equilibrium, not zero. Starting dry means every
-    -- seedling spends its first fortnight in a drought that never happened.
-    local waterRun = 30
+-- Advance exactly one day. w is that day's Climate.day() table.
+--
+-- This is the whole performance story. Walking a 400-day plant from birth
+-- costs about 28 ms on hardware; for 200 plants that is over five seconds.
+-- Stepping forward one day costs a few microseconds. Same numbers, same
+-- determinism -- the state is still entirely derivable from seed and date,
+-- we simply stop rederiving what we already know.
+function Mullein.step(st, w)
+    st.day = st.day + 1
+    if not st.alive or st.day < st.germDay then return st end
+    st.age = st.age + 1
 
-    for d = germDay, today do
-        local w = Climate.day(d)
-        st.age = st.age + 1
+    local gdd = w.meanTemp - 5.0
+    if gdd < 0 then gdd = 0 end
+    st.gdd = st.gdd + gdd
 
-        -- Warmth. The engine that drives everything.
-        local gdd = w.meanTemp - 5.0
-        if gdd < 0 then gdd = 0 end
-        st.gdd = st.gdd + gdd
+    if w.meanTemp < CHILL_BASE then st.chill = st.chill + 1 end
+    if st.chill >= CHILL_REQUIRED then st.vernalized = true end
 
-        -- Cold. Counted separately, and only useful in winter.
-        if w.meanTemp < CHILL_BASE then
-            st.chill = st.chill + 1
+    -- Water: a running balance, so a dry fortnight matters and a dry Tuesday
+    -- does not.
+    st.waterRun = st.waterRun * 0.90 + w.precipMM
+    if st.waterRun < DROUGHT_MM then
+        st.stress = st.stress + 1
+    else
+        st.stress = st.stress * 0.97
+    end
+    if st.stress > DROUGHT_LIMIT then
+        st.alive = false; st.stage = "dead"; return st
+    end
+
+    if not st.bolted then
+        local grown = math.min(MAX_LEAVES,
+            math.floor(st.gdd / (GDD_PER_LEAF * st.tr.leafRate)) + 1)
+        local spread = ROSETTE_MAX_R * st.tr.vigour
+            * math.min(1, math.sqrt(st.gdd / ROSETTE_GDD))
+
+        -- Winter dieback. Outer leaves rot off in hard cold, so the rosette
+        -- shrinks through winter and rebuilds in spring. Without it the plant
+        -- is visually frozen from August to May.
+        if w.meanTemp < 2 then
+            st.dieback = math.min(0.45, st.dieback + 0.006)
+        elseif w.meanTemp > 8 then
+            st.dieback = math.max(0, st.dieback - 0.010)
         end
-        if st.chill >= CHILL_REQUIRED then st.vernalized = true end
+        st.leaves = math.max(2, math.floor(grown * (1 - st.dieback) + 0.5))
+        st.rosetteR = spread * (1 - st.dieback * 0.55)
+    end
 
-        -- Water. A running balance rather than a per-day check, so a dry
-        -- fortnight matters and a dry Tuesday does not.
-        waterRun = waterRun * 0.90 + w.precipMM
-        if waterRun < DROUGHT_MM then
-            st.stress = st.stress + 1
-        else
-            st.stress = st.stress * 0.97
+    -- Bolting needs cold behind it, a big enough rosette, and spring warmth in
+    -- front of it. Miss any one and the plant waits another year.
+    if not st.bolted and st.vernalized and st.leaves >= BOLT_MIN_LEAVES then
+        st.springGDD = st.springGDD + gdd
+        if st.springGDD >= BOLT_GDD then
+            st.bolted = true; st.stage = "bolting"
         end
-        if st.stress > DROUGHT_LIMIT then
-            st.alive = false
-            st.stage = "dead"
-            return st
+    elseif not st.bolted then
+        st.springGDD = 0
+    end
+
+    if st.bolted and not st.seedsSet then
+        st.boltGDD = st.boltGDD + gdd
+        st.spike = math.min(SPIKE_MAX * st.tr.spikeBias, st.boltGDD / GDD_PER_CM)
+        if st.spike >= FLOWER_START then
+            st.stage = "flowering"
+            st.flowerGDD = st.flowerGDD + gdd
+            -- The open band migrates up the spike. Mullein does not flower all
+            -- over at once; a ring of blooms creeps upward for weeks.
+            -- The inflorescence is the TOP FIFTH of the stem, not everything
+            -- above some fixed height. Below it the stem is leafy; the dense
+            -- flowering club is a short terminal feature, which is what makes
+            -- a real mullein read as a cone with a candle on top.
+            local p = math.min(1, st.flowerGDD / FLOWER_GDD)
+            local base = st.spike * (1 - INFLOR_FRAC)
+            local span = st.spike - base
+            st.inflorBase = base
+            st.flowerLow = base + span * p * 0.86
+            st.flowerHigh = math.min(st.spike, st.flowerLow + span * 0.32)
+            if p >= 1 then st.seedsSet = true; st.stage = "seeding" end
         end
-
-        -- Rosette: leaves and spread, both from accumulated warmth. Note the
-        -- square root -- growth decelerates, as it does in life.
-        if not bolted then
-            local grown = math.min(MAX_LEAVES, math.floor(st.gdd / GDD_PER_LEAF))
-            local spread = ROSETTE_MAX_R * math.min(1, math.sqrt(st.gdd / ROSETTE_GDD))
-
-            -- Winter dieback. Outer leaves rot off in hard cold, so the
-            -- rosette shrinks through winter and rebuilds in spring. Without
-            -- this the plant is visually frozen from August to May, which is
-            -- eight months of nothing to look at.
-            if w.meanTemp < 2 then
-                dieback = math.min(0.45, dieback + 0.006)
-            elseif w.meanTemp > 8 then
-                dieback = math.max(0, dieback - 0.010)
-            end
-            st.leaves = math.max(2, math.floor(grown * (1 - dieback) + 0.5))
-            st.rosetteR = spread * (1 - dieback * 0.55)
-        end
-
-        -- Bolting. Needs cold behind it, a big enough rosette, and spring
-        -- warmth in front of it. Miss any one and the plant waits another year.
-        if not bolted and st.vernalized and st.leaves >= BOLT_MIN_LEAVES then
-            springGDD = springGDD + gdd
-            if springGDD >= BOLT_GDD then
-                bolted = true
-                st.stage = "bolting"
-            end
-        elseif not bolted then
-            springGDD = 0
-        end
-
-        if bolted and not st.seedsSet then
-            boltGDD = boltGDD + gdd
-            st.spike = math.min(SPIKE_MAX, boltGDD / GDD_PER_CM)
-
-            if st.spike >= FLOWER_START then
-                st.stage = "flowering"
-                flowerGDD = flowerGDD + gdd
-                -- The open band migrates up the spike. Mullein does not flower
-                -- all over at once; a ring of blooms creeps upward for weeks.
-                local p = math.min(1, flowerGDD / FLOWER_GDD)
-                st.flowerHigh = FLOWER_START + (st.spike - FLOWER_START) * p + 14
-                st.flowerLow = st.flowerHigh - 46
-                if st.flowerLow < FLOWER_START * 0.6 then
-                    st.flowerLow = FLOWER_START * 0.6
-                end
-                if p >= 1 then
-                    st.seedsSet = true
-                    st.stage = "seeding"
-                end
-            end
-        elseif st.seedsSet then
-            seedGDD = seedGDD + gdd
-            if seedGDD >= SEED_GDD then
-                st.alive = false
-                st.stage = "dead"
-                return st
-            end
-        end
-
-        if not bolted then
-            st.stage = (st.leaves < 3) and "seedling" or "rosette"
+    elseif st.seedsSet then
+        st.seedGDD = st.seedGDD + gdd
+        if st.seedGDD >= SEED_GDD then
+            st.alive = false; st.stage = "dead"; return st
         end
     end
 
+    if not st.bolted then
+        st.stage = (st.leaves < 3) and "seedling" or "rosette"
+    end
+    return st
+end
+
+-- Convenience: build a plant from scratch. Fine for one plant on a bench,
+-- wrong for two hundred in a field -- use new() plus step() there.
+function Mullein.grow(germDay, today, seed)
+    local st = Mullein.new(germDay, seed)
+    for d = germDay, today do
+        Mullein.step(st, Climate.day(d))
+    end
     return st
 end
 
@@ -227,63 +243,147 @@ local function leafPolygon(angleDeg, length, width)
         pts[#pts + 1] = { px - ca * hw, py + sa * hw }
     end
 
-    return { points = pts }
+    -- The midrib. On a 1-bit screen overlapping leaves collapse into a single
+    -- silhouette; one line down the centre of each is what separates them
+    -- again, and it is also the first thing a botanical plate draws.
+    return { points = pts, midrib = { bx, by, tx, ty } }
+end
+
+-- Two deterministic pseudo-randoms per leaf, so every leaf has its own
+-- terminal size, proportions and lean -- but the SAME ones every time it is
+-- drawn. Two cheap sin-fract hashes; no state, no table of stored values.
+local function leafRand(i, salt, seed)
+    local x = math.sin(i * 78.233 + salt * 12.9898 + seed * 3.7351) * 43758.5453
+    return x - math.floor(x)
+end
+
+-- Per-plant constitution, derived once from the seed. Two mulleins in the
+-- same field get the same weather and the same rules, and still grow into
+-- visibly different plants -- one squat and broad, another lanky, another
+-- lopsided. Without this every plant in the field is a clone.
+function Mullein.traits(seed)
+    local function r(salt)
+        local x = math.sin(seed * 91.7 + salt * 27.13) * 24634.6345
+        return x - math.floor(x)
+    end
+    return {
+        vigour    = 0.74 + 0.52 * r(1),   -- overall size, rosette and spike
+        leafRate  = 0.84 + 0.32 * r(2),   -- how fast new leaves emerge
+        fanPhase  = r(3),                 -- rotates the whole fan
+        widthBias = 0.82 + 0.36 * r(4),   -- narrow-leaved or broad-leaved
+        lean      = (r(5) - 0.5) * 22,    -- the whole rosette tips a little
+        spikeBias = 0.80 + 0.40 * r(6),
+    }
 end
 
 function Mullein.geometry(st)
     local parts = {}
-    if st.stage == "seed" then return parts end
+    if st.stage == "seed" or st.leaves < 1 then return parts end
 
-    -- Oldest leaves are longest and lie nearly flat; the newest stand up in
-    -- the middle. Drawn oldest first so the young centre sits on top, which
-    -- is the one bit of depth a flat fan actually needs.
-    local n = st.leaves
-    for i = 1, n do
-        local age = (n > 1) and (1 - (i - 1) / (n - 1)) or 1   -- 1 = oldest
-        local mag = 18 + 66 * age + jitter(i, 9)
-        local side = (i % 2 == 0) and 1 or -1
-        local length = st.rosetteR * (0.45 + 0.55 * age)
-        if st.spike > 0 then
-            -- Rosette leaves wither back once the spike takes over.
-            local decline = math.min(1, st.spike / SPIKE_MAX * 1.4)
-            length = length * (1 - 0.55 * decline)
+    -- Each leaf grows from its OWN age, not from its rank in the list.
+    -- Ranking was the bug: the instant a second leaf appeared, the first
+    -- jumped to a new size and angle. Now a leaf emerges at effectively zero
+    -- size, swells toward its own terminal size, and is pushed progressively
+    -- flatter as it ages -- which is what a rosette actually does.
+    local tr = st.tr or Mullein.traits(1)
+    for i = 1, st.leaves do
+        local born = (i - 1) * GDD_PER_LEAF * tr.leafRate
+        local ageGDD = st.gdd - born
+        if ageGDD > 0 then
+            local grow = 1 - math.exp(-ageGDD / LEAF_TAU)      -- size, 0 -> 1
+            local flat = 1 - math.exp(-ageGDD / ANGLE_TAU)     -- lean, 0 -> 1
+
+            -- Each leaf owns a FIXED slot in the fan, from the golden-ratio
+            -- sequence. That sequence is low-discrepancy: successive values
+            -- fill the interval evenly wherever you stop, so three leaves are
+            -- already spread across the arc, and so are seven. It is the same
+            -- property that makes real phyllotaxis use the golden angle --
+            -- optimal packing at every stage of growth.
+            --
+            -- Deriving the angle from AGE instead gives a slowly opening V,
+            -- because young leaves all bunch upright and old ones all lie
+            -- flat with nothing between them.
+            -- fanPhase rotates the sequence. A rotation of a low-discrepancy
+            -- sequence is still low-discrepancy, so the fan stays evenly
+            -- spread while landing in different places on every plant.
+            local slot = (i * 0.618034 + tr.fanPhase) % 1
+            local target = -FAN_SPREAD + 2 * FAN_SPREAD * slot
+
+            local terminal = st.rosetteR * (0.72 + 0.38 * leafRand(i, 1, st.seed or 1))
+            local length = terminal * grow
+            if st.spike > 0 then
+                local decline = math.min(1, st.spike / SPIKE_MAX * 1.4)
+                length = length * (1 - 0.55 * decline)
+            end
+            local width = length * tr.widthBias
+                * (0.145 + 0.05 * leafRand(i, 2, st.seed or 1))
+
+            -- Age only opens the leaf OUT toward its slot. A new leaf starts
+            -- half-raised in the middle and settles outward as it matures,
+            -- which keeps the age cue without collapsing the fan.
+            local angle = target * (0.5 + 0.5 * flat) + tr.lean
+                        + (leafRand(i, 3, st.seed or 1) - 0.5) * 13
+
+            if length > 0.4 then
+                parts[#parts + 1] = leafPolygon(angle, length, width)
+            end
         end
-        parts[#parts + 1] = leafPolygon(side * mag, length, length * 0.34)
     end
 
     if st.spike > 0 then
-        local halfW = 1.6
+        local base = (st.inflorBase > 0) and st.inflorBase or st.spike
+        local halfW = 1.7 * tr.vigour
+
+        -- A tapered stem. Thicker at the ground than at the tip.
         parts[#parts + 1] = { kind = "stem", points = {
             { -halfW, 0 }, { halfW, 0 },
-            { halfW * 0.55, st.spike }, { -halfW * 0.55, st.spike } } }
+            { halfW * 0.45, st.spike }, { -halfW * 0.45, st.spike } } }
 
-        -- Stem leaves, decreasing up the spike.
-        local n = math.floor(st.spike / 22)
-        for i = 1, n do
-            local h = 14 + (i - 1) * 22
-            if h < st.spike * 0.82 then
-                local len = st.rosetteR * 0.55 * (1 - h / st.spike)
-                local side = (i % 2 == 0) and 1 or -1
-                parts[#parts + 1] = { kind = "stemleaf", points = {
-                    { 0, h + 2 }, { side * len, h + len * 0.22 },
-                    { side * len * 0.9, h - len * 0.1 }, { 0, h - 2 } } }
+        -- Cauline leaves: the same spiral continuing up the stem, each one
+        -- smaller than the last and held more upright. That decreasing series
+        -- is what produces the cone -- broad at the bottom, narrowing to the
+        -- flower spike. They are not decoration; they ARE the silhouette.
+        local leafy = base
+        local n = math.floor(leafy / CAULINE_GAP)
+        for k = 1, n do
+            local h = (k - 0.4) * CAULINE_GAP
+            if h < leafy then
+                local up = h / leafy                       -- 0 base, 1 top
+                local len = st.rosetteR * tr.vigour * 0.78 * ((1 - up) ^ 0.85)
+                if len > 0.6 then
+                    local slot = (k * 0.618034 + tr.fanPhase) % 1
+                    local side = (slot >= 0.5) and 1 or -1
+                    -- Ascending: nearly horizontal low down, hugging the stem
+                    -- near the top.
+                    local ang = side * (68 - 44 * up
+                        + (leafRand(k, 7, st.seed or 1) - 0.5) * 16)
+                    local leaf = leafPolygon(ang, len, len * 0.20 * tr.widthBias)
+                    for _, pt in ipairs(leaf.points) do pt[2] = pt[2] + h end
+                    leaf.midrib[2] = leaf.midrib[2] + h
+                    leaf.midrib[4] = leaf.midrib[4] + h
+                    parts[#parts + 1] = leaf
+                end
             end
         end
 
         if st.flowerHigh > 0 then
-            -- Two bands: the open flowers, and the spent capsules below them,
-            -- which are what actually carries the seed. The club shape is the
-            -- diagnostic feature at a distance.
-            -- One continuous club: spent capsules below, open flowers above,
-            -- both tapering into the stem so it does not read as two pills
-            -- floating on a wire.
-            local top = math.min(st.flowerHigh, st.spike)
-            parts[#parts + 1] = { kind = "capsules",
-                low = FLOWER_START * 0.5, high = st.flowerLow,
-                wLow = 2.2, wHigh = 6.4 }
+            local w = 4.6 * tr.vigour
+            -- Three bands up the terminal spike: spent capsules below, the
+            -- open ring, unopened buds above. The ring creeps upward for
+            -- weeks, which is how mullein actually flowers.
+            if st.flowerLow > base then
+                parts[#parts + 1] = { kind = "capsules",
+                    low = base, high = st.flowerLow,
+                    wLow = w * 0.85, wHigh = w }
+            end
             parts[#parts + 1] = { kind = "flowers",
-                low = st.flowerLow, high = top,
-                wLow = 6.4, wHigh = 2.4 }
+                low = st.flowerLow, high = st.flowerHigh,
+                wLow = w, wHigh = w * 0.95 }
+            if st.flowerHigh < st.spike then
+                parts[#parts + 1] = { kind = "buds",
+                    low = st.flowerHigh, high = st.spike,
+                    wLow = w * 0.95, wHigh = w * 0.35 }
+            end
         end
     end
 

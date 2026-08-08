@@ -144,13 +144,15 @@ local GERM_DAY <const> = 40          -- mid-April of year one
 local BENCH_TARGET_PX <const> = 190
 local BENCH_MAX_SCALE <const> = 6.0
 local specimenView = false
+local plantGeom = nil          -- geometry cached per day; growth is daily
+local plantSeed = 1            -- Left/Right on the bench reseeds the specimen
 
 -- 0 nothing, 1 a single line, 2 everything. Down cycles.
 local uiMode = 1
 local plant, plantDay = nil, nil
 
 local function drawPlantPart(part, ox, oy, PX_PER_CM, ink)
-    if part.kind == "flowers" or part.kind == "capsules" then
+    if part.kind == "flowers" or part.kind == "capsules" or part.kind == "buds" then
         -- A tapered quad, not a rounded rect: the two bands then meet flush
         -- and read as one club rather than two pills threaded on a wire.
         local wl = part.wLow * PX_PER_CM
@@ -159,10 +161,12 @@ local function drawPlantPart(part, ox, oy, PX_PER_CM, ink)
         local yh = oy - part.high * PX_PER_CM
         local quad = { ox - wl, yl, ox + wl, yl, ox + wh, yh, ox - wh, yh }
         if part.kind == "flowers" then
-            gfx.setColor(ink)
+            gfx.setColor(ink)                      -- open flowers: solid
             gfx.fillPolygon(table.unpack(quad))
         else
-            gfx.setPattern(tone(0.55))
+            -- Spent capsules below and unopened buds above, both lighter than
+            -- the open ring so the flowering band reads as it creeps up.
+            gfx.setPattern(tone(part.kind == "buds" and 0.72 or 0.48))
             gfx.fillPolygon(table.unpack(quad))
             gfx.setColor(ink)
             quad[#quad + 1] = quad[1]; quad[#quad + 1] = quad[2]
@@ -185,6 +189,12 @@ local function drawPlantPart(part, ox, oy, PX_PER_CM, ink)
     flat[#flat + 1] = flat[1]
     flat[#flat + 1] = flat[2]
     gfx.drawPolygon(table.unpack(flat))
+
+    if part.midrib then
+        local m = part.midrib
+        gfx.drawLine(ox + m[1] * PX_PER_CM, oy - m[2] * PX_PER_CM,
+                     ox + m[3] * PX_PER_CM, oy - m[4] * PX_PER_CM)
+    end
     gfx.setColor(gfx.kColorBlack)   -- never leave a pattern set
 end
 
@@ -291,6 +301,15 @@ function playdate.update()
     end
     if playdate.buttonJustPressed(playdate.kButtonDown) then
         uiMode = (uiMode + 1) % 3
+    end
+    -- On the bench, Left and Right draw a different individual: same species,
+    -- same weather, same germination date, different plant.
+    if specimenView then
+        if playdate.buttonJustPressed(playdate.kButtonRight) then
+            plantSeed = plantSeed + 1; plantDay = nil
+        elseif playdate.buttonJustPressed(playdate.kButtonLeft) then
+            plantSeed = math.max(1, plantSeed - 1); plantDay = nil
+        end
     end
 
     local fast = playdate.buttonIsPressed(playdate.kButtonA)
@@ -410,10 +429,21 @@ function playdate.update()
     -- The specimen, if we are looking at it.
     if specimenView then
         if plantDay ~= gameDay then
+            -- Step forward if we can; rebuild only on a jump or a rewind.
+            -- Geometry is regenerated here and only here -- growth changes
+            -- once a day, so rebuilding it every frame is 30x wasted work.
+            if plant and plantDay and gameDay == plantDay + 1 then
+                Mullein.step(plant, today)
+            else
+                plant = Mullein.new(GERM_DAY, plantSeed)
+                for d = GERM_DAY, gameDay do
+                    Mullein.step(plant, Climate.day(d))
+                end
+            end
             plantDay = gameDay
-            plant = Mullein.grow(GERM_DAY, gameDay)
+            plantGeom = Mullein.geometry(plant)
         end
-        local parts = Mullein.geometry(plant)
+        local parts = plantGeom
 
         local tall = math.max(plant.spike, plant.rosetteR * 0.9, 12)
         local scale = math.min(BENCH_MAX_SCALE, BENCH_TARGET_PX / tall)
@@ -426,7 +456,7 @@ function playdate.update()
             panel(232, 34, 164, 86)
             gfx.setColor(gfx.kColorBlack)
             gfx.drawText(plant.stage, 239, 40)
-            gfx.drawText(string.format("age %d days", plant.age), 239, 57)
+            gfx.drawText(string.format("age %d  no.%d", plant.age, plantSeed), 239, 57)
             gfx.drawText(string.format("%d leaves  %.0fcm",
                 plant.leaves, plant.rosetteR * 2), 239, 74)
             if plant.spike > 0 then
