@@ -32,9 +32,15 @@ local DIURNAL <const> = 9.2   -- C
 
 -- Precipitation. RI is famously even across the year -- there is no dry
 -- season, which is why the seasonal term is so small.
-local WET_PROB      <const> = 0.34   -- fraction of days with measurable precip
-local WET_PROB_SWING<const> = 0.04   -- slightly wetter in late autumn
-local WET_MEAN_MM   <const> = 9.4    -- mean accumulation on a wet day
+-- Rhode Island has no dry season -- monthly TOTALS are famously flat. But the
+-- STRUCTURE is not: winter delivers its rain as frequent light events off the
+-- ocean, summer as fewer, heavier convective storms. Same total, different
+-- shape. So wet-day frequency peaks in winter while amount-per-wet-day peaks
+-- in summer, and the two swings roughly cancel in the monthly figures.
+local WET_PROB      <const> = 0.34   -- annual mean fraction of wet days
+local WET_PROB_SWING<const> = 0.035  -- +winter / -summer
+local WET_MEAN_MM   <const> = 9.4    -- annual mean accumulation on a wet day
+local WET_MEAN_SWING<const> = 0.10   -- fractional; summer storms are heavier
 local WET_CUTOFF    <const> = 0.4079 -- measured percentile of the wet channel
 local CUTOFF_SLOPE  <const> = 2.60   -- d(cutoff)/d(probability), measured
 local SNOW_RATIO    <const> = 10.0   -- mm liquid -> mm snow depth
@@ -44,6 +50,10 @@ local LATITUDE <const> = 41.82       -- degrees north
 -- Growing degree days. Base 5 C suits a temperate meadow; base 10 is for
 -- warm-season crops and would under-count your spring.
 local GDD_BASE <const> = 5.0
+
+-- Floor brightness on a moonless night. Not zero: starlight alone casts
+-- enough for silhouettes, which backlog item 7 depends on entirely.
+local STARLIGHT <const> = 0.015
 
 local DAYS_PER_YEAR <const> = 365
 local TWO_PI <const> = math.pi * 2
@@ -118,6 +128,12 @@ local function uniform(day, channel)
     return (lattice(day, channel) + 1) * 0.5
 end
 
+-- Exposed so other modules (wind, dispersal, plants) share one noise source
+-- rather than each rolling their own. Use a distinct channel number per
+-- signal; channels are decorrelated by construction.
+Climate.fractalNoise = fractalNoise
+Climate.uniform = uniform
+
 -- ===== Public model =========================================================
 
 -- Seasonal curve. dayOfYear is 0-based from January 1.
@@ -158,8 +174,10 @@ function Climate.day(dayIndex)
     -- Precipitation on its own noise channel, so wet spells cluster the same
     -- way warm spells do, but independently of them.
     local pNoise = fractalNoise(dayIndex, 7)
-    local target = WET_PROB + WET_PROB_SWING *
-        math.cos(TWO_PI * (dayOfYear - 300) / DAYS_PER_YEAR)
+    -- Peaks at the coldest point of the year, same phase as the temperature
+    -- minimum, which is why T_COLDEST appears here.
+    local seasonal = math.cos(TWO_PI * (dayOfYear - T_COLDEST) / DAYS_PER_YEAR)
+    local target = WET_PROB + WET_PROB_SWING * seasonal
     -- WET_CUTOFF is the empirical 66th percentile of this noise channel,
     -- measured over 400k days. CUTOFF_SLOPE converts a change in target
     -- probability into a shift of that threshold.
@@ -173,7 +191,8 @@ function Climate.day(dayIndex)
         -- hard it rains does not (white channel). Mean falls out exactly at
         -- WET_MEAN_MM, and the tail reaches ~50 mm, which is a nor'easter.
         local u = uniform(dayIndex, 23)
-        precipMM = -WET_MEAN_MM * 1.061 * math.log(1 - u * 0.995)
+        local scale = WET_MEAN_MM * (1 - WET_MEAN_SWING * seasonal)
+        precipMM = -scale * 1.061 * math.log(1 - u * 0.995)
         if meanTemp < 1.0 then
             snowMM = precipMM * SNOW_RATIO
         end
@@ -292,10 +311,7 @@ end
 -- identical. The square root is a perceptual squash, the same instinct as
 -- putting a fader on a log taper.
 --
--- moonFraction is a placeholder for backlog item 3: pass the illuminated
--- fraction once moon phases exist. 0 = new moon, 1 = full.
-function Climate.brightness(w, hour, moonFraction)
-    moonFraction = moonFraction or 0.5
+function Climate.brightness(w, hour)
     local elev = Climate.solarElevation(w.dayOfYear, hour)
 
     local sky
@@ -307,9 +323,9 @@ function Climate.brightness(w, hour, moonFraction)
         sky = 0
     end
 
-    -- Moonlight is the floor once the sun is properly down. Full moon on snow
-    -- is genuinely enough to walk by; a new moon is not.
-    local moon = 0.02 + 0.10 * moonFraction
+    -- Real moonlight, from phase and altitude. A full moon riding high is
+    -- genuinely enough to walk by; a new moon leaves only starlight.
+    local moon = Climate.moonLight(w.dayIndex, hour) + STARLIGHT
     if sky < moon then sky = moon end
 
     -- Occlusion. Heavy rain takes about three quarters of the light; clouds
@@ -317,3 +333,93 @@ function Climate.brightness(w, hour, moonFraction)
     local occ = 1 - 0.75 * Climate.precipAtHour(w, hour)
     return sky * occ
 end
+
+-- ===== The moon ============================================================
+--
+-- Low-precision but structurally honest. The orbital inclination of 5.1 deg
+-- is ignored, which is what makes eclipses impossible here and costs a few
+-- degrees of altitude. Everything else is real.
+
+local SYNODIC <const> = 29.53059      -- new moon to new moon, days
+local MOON_EPOCH <const> = 0          -- game day of a new moon; tunable
+
+-- Phase as a fraction: 0 and 1 are new, 0.5 is full.
+function Climate.moonPhase(dayIndex, hour)
+    local t = (dayIndex + (hour or 12) / 24 - MOON_EPOCH) / SYNODIC
+    return t - math.floor(t)
+end
+
+-- Illuminated fraction of the disc, 0 to 1.
+function Climate.moonIllumination(phase)
+    return (1 - math.cos(TWO_PI * phase)) / 2
+end
+
+local PHASE_NAMES <const> = {
+    "new", "waxing crescent", "first quarter", "waxing gibbous",
+    "full", "waning gibbous", "last quarter", "waning crescent",
+}
+
+function Climate.moonPhaseName(phase)
+    -- Eight bins centred on the named phases, so "full" covers the days
+    -- either side of exact full rather than a single instant.
+    local i = math.floor(phase * 8 + 0.5) % 8
+    return PHASE_NAMES[i + 1]
+end
+
+-- Altitude above the horizon, degrees. Negative means below.
+--
+-- Two facts do all the work here. First: the moon's hour angle lags the sun's
+-- by exactly its phase, which is why a new moon rises at sunrise and a full
+-- moon rises at sunset -- phase and rise time are the same quantity. Second:
+-- the moon sits opposite the sun on the ecliptic by that same phase, so a
+-- full moon in winter takes the summer sun's high path, and a full moon in
+-- summer skulks along the horizon.
+function Climate.moonAltitude(dayIndex, hour)
+    local dayOfYear = Climate.calendarDay(dayIndex)
+    local phase = Climate.moonPhase(dayIndex, hour)
+
+    -- Sun's position on the ecliptic, then the moon's, offset by the phase.
+    local sunLon  = TWO_PI * (dayOfYear - 80.5) / DAYS_PER_YEAR
+    local moonLon = sunLon + TWO_PI * phase
+    local decl = math.asin(math.sin(0.4093) * math.sin(moonLon))
+
+    local phi = math.rad(LATITUDE)
+    -- MINUS, not plus. The moon drifts eastward against the stars, so it
+    -- LAGS the sun -- rising ~50 min later each day. Getting this sign wrong
+    -- still gives a correct new moon and full moon (0 and 180 are symmetric)
+    -- and only betrays itself at the quarters, which is a nasty way to be
+    -- wrong. First quarter must rise at noon and set at midnight.
+    local H = math.rad(15 * (hour - 12) - 360 * phase)
+    local s = math.sin(phi) * math.sin(decl) + math.cos(phi) * math.cos(decl) * math.cos(H)
+    if s > 1 then s = 1 elseif s < -1 then s = -1 end
+    return math.deg(math.asin(s))
+end
+
+-- Light the moon actually contributes, on the same 0-1 scale as daylight.
+--
+-- The exponent is not decoration. Moonlight is strongly non-linear in
+-- illuminated fraction: a half moon gives roughly a TENTH of a full moon's
+-- light, not a half, because of shadowing across the terminator and the
+-- opposition surge at full. 0.5^3.32 = 0.1, hence 3.32.
+local MOON_MAX <const> = 0.13
+
+function Climate.moonLight(dayIndex, hour)
+    local phase = Climate.moonPhase(dayIndex, hour)
+    local frac = Climate.moonIllumination(phase)
+    local alt = Climate.moonAltitude(dayIndex, hour)
+    if alt <= 0 then return 0 end
+    return MOON_MAX * (frac ^ 3.32) * math.sin(math.rad(alt))
+end
+
+-- Hour angle of the moon, degrees, normalised to -180..+180. Zero means the
+-- moon is due south and at its highest for that night.
+function Climate.moonHourAngle(dayIndex, hour)
+    local phase = Climate.moonPhase(dayIndex, hour)
+    local H = 15 * (hour - 12) - 360 * phase
+    H = H % 360
+    if H > 180 then H = H - 360 end
+    return H
+end
+
+-- Peak moonlight, exposed so the renderer can scale star visibility against it.
+function Climate.moonLightMax() return 0.13 end

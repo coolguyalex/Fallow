@@ -1,5 +1,7 @@
 # Fallow
 
+A field left to itself, and the years that pass over it.
+
 A Playdate game about ecological succession in an abandoned New England field.
 Seeds blow in, take root, and grow. Insects arrive once there is plant life;
 birds follow the insects and drop berry seeds. The field slowly changes while
@@ -11,12 +13,11 @@ you mostly watch.
 
 ## The crank is time
 
-The first day the game is run on your playdate marks time 0. 
-After that, turning the crank advances the clock — but never past the real one. Each
+Turning the crank advances the clock — but never past the real one. Each
 session you crank from where you left off up to now. Play once a month and you
-crank through a month of weather, seed dispersal and visits. 
+crank through a month of weather, seed dispersal and visits.
 
-This gives the illusion of running through time that has elapsed. However, this is not playback and The field's state at any moment is a deterministic
+This is not playback. The field's state at any moment is a deterministic
 function of `(fieldSeed, timestamp)`, so there is no background simulation and
 no saved world. A year of absence costs nothing at runtime; it is rendered on
 demand.
@@ -24,7 +25,7 @@ demand.
 You can collect wind-blown seeds, uproot plants, and bank specimens. You cannot
 obtain seeds any other way, control the weather, or rewind. **Any intervention
 locks that timeline permanently** — every choice is a bet placed without seeing
-the rest of the year, no rewind and undo. 
+the rest of the year.
 
 ## What runs today
 
@@ -42,7 +43,7 @@ Requires the [Playdate SDK](https://play.date/dev/) with its `bin` directory
 on your `PATH`.
 
 ```
-git clone https://github.com/coolguyalex/Fallow.git
+git clone https://github.com/<you>/Fallow.git
 cd Fallow
 pdc Source Fallow.pdx
 ```
