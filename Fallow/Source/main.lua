@@ -14,10 +14,12 @@ local gfx <const> = playdate.graphics
 -- The one number that matters. 240 = a day costs six turns of the crank.
 local MINUTES_PER_REVOLUTION <const> = 240
 
--- Hold A to skim. At 10x one revolution buys about a day and two thirds,
--- which is the gearing you want for crossing a long absence. Slow cranking
--- stays the default because that is where anything can be looked at.
-local FAST_MULTIPLIER <const> = 10
+-- A cycles the gearing rather than being held. At 240 min/rev these buy,
+-- per revolution: four hours, twenty hours, four days, sixteen days.
+-- Photography and intervention will eventually be gated to the bottom gear,
+-- which is what stops the top gears from simply being better.
+local GEARS <const> = { 1, 5, 25, 100 }
+local gear = 1
 
 local SCREEN_W   <const> = 400
 local SCREEN_H   <const> = 240
@@ -152,25 +154,21 @@ local uiMode = 1
 local plant, plantDay = nil, nil
 
 local function drawPlantPart(part, ox, oy, PX_PER_CM, ink)
-    if part.kind == "flowers" or part.kind == "capsules" or part.kind == "buds" then
-        -- A tapered quad, not a rounded rect: the two bands then meet flush
-        -- and read as one club rather than two pills threaded on a wire.
-        local wl = part.wLow * PX_PER_CM
-        local wh = part.wHigh * PX_PER_CM
-        local yl = oy - part.low * PX_PER_CM
-        local yh = oy - part.high * PX_PER_CM
-        local quad = { ox - wl, yl, ox + wl, yl, ox + wh, yh, ox - wh, yh }
-        if part.kind == "flowers" then
-            gfx.setColor(ink)                      -- open flowers: solid
-            gfx.fillPolygon(table.unpack(quad))
-        else
-            -- Spent capsules below and unopened buds above, both lighter than
-            -- the open ring so the flowering band reads as it creeps up.
-            gfx.setPattern(tone(part.kind == "buds" and 0.72 or 0.48))
-            gfx.fillPolygon(table.unpack(quad))
+    if part.kind == "floret" then
+        local x = ox + part.x * PX_PER_CM
+        local y = oy - part.y * PX_PER_CM
+        local r = math.max(1, part.r * PX_PER_CM)
+        if part.state == "open" then
             gfx.setColor(ink)
-            quad[#quad + 1] = quad[1]; quad[#quad + 1] = quad[2]
-            gfx.drawPolygon(table.unpack(quad))
+            gfx.fillCircleAtPoint(x, y, r)
+        elseif part.state == "bud" then
+            gfx.setPattern(tone(0.62))
+            gfx.fillCircleAtPoint(x, y, r * 0.8)
+            gfx.setColor(ink)
+            gfx.drawCircleAtPoint(x, y, r * 0.8)
+        else                                    -- spent capsule
+            gfx.setColor(ink)
+            gfx.drawCircleAtPoint(x, y, r * 0.72)
         end
         gfx.setColor(gfx.kColorBlack)
         return
@@ -312,9 +310,12 @@ function playdate.update()
         end
     end
 
-    local fast = playdate.buttonIsPressed(playdate.kButtonA)
-    local gearing = MINUTES_PER_REVOLUTION * (fast and FAST_MULTIPLIER or 1)
-    totalMinutes = totalMinutes + (playdate.getCrankChange() / 360) * gearing
+    if playdate.buttonJustPressed(playdate.kButtonA) then
+        gear = gear % #GEARS + 1
+    end
+    local mult = GEARS[gear]
+    totalMinutes = totalMinutes
+        + (playdate.getCrankChange() / 360) * MINUTES_PER_REVOLUTION * mult
     if totalMinutes < 0 then totalMinutes = 0 end   -- the field has a day one
 
     local gameDay     = math.floor(totalMinutes / MINUTES_PER_DAY)
@@ -432,12 +433,20 @@ function playdate.update()
             -- Step forward if we can; rebuild only on a jump or a rewind.
             -- Geometry is regenerated here and only here -- growth changes
             -- once a day, so rebuilding it every frame is 30x wasted work.
-            if plant and plantDay and gameDay == plantDay + 1 then
-                Mullein.step(plant, today)
+            if plant and plantDay and gameDay > plantDay
+               and gameDay - plantDay < 400 then
+                -- Top gear can cross a fortnight in a single frame. Step
+                -- through the gap rather than rebuilding from germination,
+                -- which would otherwise fire every frame at 100x.
+                for d = plantDay + 1, gameDay do
+                    local wd = Climate.day(d)
+                    Mullein.step(plant, wd, Wind.at(wd, 14).speed)
+                end
             else
                 plant = Mullein.new(GERM_DAY, plantSeed)
                 for d = GERM_DAY, gameDay do
-                    Mullein.step(plant, Climate.day(d))
+                    local wd = Climate.day(d)
+                    Mullein.step(plant, wd, Wind.at(wd, 14).speed)
                 end
             end
             plantDay = gameDay
@@ -460,7 +469,11 @@ function playdate.update()
             gfx.drawText(string.format("%d leaves  %.0fcm",
                 plant.leaves, plant.rosetteR * 2), 239, 74)
             if plant.spike > 0 then
+                if plant.seedsShed > 100 then
+                gfx.drawText(string.format("%.0fk seed shed", plant.seedsShed / 1000), 239, 91)
+            else
                 gfx.drawText(string.format("spike %.0fcm", plant.spike), 239, 91)
+            end
             else
                 gfx.drawText(string.format("chill %d/45", plant.chill), 239, 91)
             end
@@ -520,10 +533,15 @@ function playdate.update()
         end
     end
 
-    if fast then
-        panel(346, 34, 44, 22)
+    -- The gear is a mode the player chose, not a readout, so it shows even
+    -- with the instruments dismissed -- otherwise you can be in top gear
+    -- without knowing it.
+    if mult > 1 then
+        local label = mult .. "x"
+        local w = 22 + #label * 9
+        panel(SCREEN_W - w - 6, SCREEN_H - 28, w, 22)
         gfx.setColor(gfx.kColorBlack)
-        gfx.drawText("10x", 356, 38)
+        gfx.drawText(label, SCREEN_W - w + 5, SCREEN_H - 24)
     end
 
     if uiMode > 0 then

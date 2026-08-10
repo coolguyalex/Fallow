@@ -122,10 +122,28 @@ biology.
 
 **10b. Species considerations, deferred deliberately.**
 
-*Dispersal.* Mullein is not classically wind-dispersed — the capsule shakes
-tiny seeds out within a few metres. Long-distance arrival is via soil and
-disturbance. It sits in the WEST (city) pool in `wind.lua` as a Eurasian
-ruderal, which is honest.
+*Dispersal — a CENSER mechanism, now partly implemented.* Mullein has no
+wind-adapted seed at all: no pappus, no wing. The capsules split and the
+dust-fine seed is SHAKEN out by wind rocking the tall dry stalk. Most lands
+within a metre of the parent.
+
+Three consequences worth building on:
+
+- **Seed clumps, it does not spread.** A dead mullein leaves a dense patch
+  beneath it, not a scatter across the field. Combined with decades of
+  viability, that is a bank in one spot — so disturbing THAT spot years later
+  is what brings mullein back.
+- **The dead stalk keeps working all winter.** It stands, and it goes on
+  shedding for months after the plant died. A dead plant is not an inert
+  object; leaving it standing versus pulling it up is a real decision.
+- **Wind speed drives the rate.** `Mullein.step` already takes wind speed and
+  sheds proportionally, which finally gives the wind model a direct mechanical
+  role rather than a decorative one. A still autumn banks the seed for later;
+  a gale empties the stalk in a fortnight.
+
+One plant carries something like 140,000 seeds. Long-distance arrival is via
+soil and disturbance, which is why mullein sits in the WEST (city) pool in
+`wind.lua` as a Eurasian ruderal.
 
 *Seed viability.* Mullein's is extraordinary: decades in soil, up to a century
 documented. Should be a per-species parameter with an enormous range (willow is
